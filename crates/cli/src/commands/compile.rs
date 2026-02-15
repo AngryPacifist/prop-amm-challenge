@@ -114,17 +114,20 @@ pub fn compile_bpf(rs_file: &str) -> anyhow::Result<PathBuf> {
 
 fn find_native_lib(build_dir: &Path) -> anyhow::Result<PathBuf> {
     let release_dir = build_dir.join("target").join("release");
-    let ext = if cfg!(target_os = "macos") {
-        "dylib"
+    let (ext, needs_lib_prefix) = if cfg!(target_os = "macos") {
+        ("dylib", true)
+    } else if cfg!(target_os = "windows") {
+        ("dll", false)
     } else {
-        "so"
+        ("so", true)
     };
 
     if let Ok(entries) = std::fs::read_dir(&release_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with("lib") && name.ends_with(ext) {
+            let prefix_ok = !needs_lib_prefix || name.starts_with("lib");
+            if prefix_ok && name.ends_with(ext) {
                 return Ok(entry.path());
             }
         }

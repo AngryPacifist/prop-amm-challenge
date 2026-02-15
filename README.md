@@ -1,324 +1,123 @@
-# Prop AMM Challenge
+# Prop AMM Challenge — σ-Adaptive Blended Curve
 
-**https://ammchallenge.com/prop-amm**
+**Competition:** [Prop AMM Challenge](https://ammchallenge.com/prop-amm)  
+**Author:** [@angry_pacifist](https://x.com/angry__pacifist)  
+**AI:** Claude Sonnet 4  
+**Current Server Edge:** 458.01 avg / 1000 sims (pending resubmission with blended curve)  
+**Local Edge (12-seed validation):** 88.83
 
-Design a custom price function for an automated market maker. Your goal: maximize **edge** — the profit your AMM extracts from trading flow.
+---
 
-Your program runs inside a simulation against a benchmark AMM. Retail traders arrive, arbitrageurs keep prices efficient, and an order router splits flow between the two pools based on who offers better prices. The better your pricing, the more flow you attract and the more edge you earn.
+## What This Is
+
+A custom pricing function for a simulated automated market maker (AMM). The goal: maximize **edge** — the profit your AMM extracts from trading flow relative to a benchmark normalizer AMM.
+
+Your program runs inside a BPF simulation against a benchmark CFMM. Retail traders arrive, arbitrageurs keep prices efficient, and an order router splits flow between the two pools based on who offers better prices. The better your pricing, the more flow you attract and the more edge you earn.
+
+## Strategy Overview
+
+A **σ-adaptive blended curve** that continuously interpolates between two pricing functions based on real-time volatility estimation:
+
+| Regime | σ Range | Curve | Rationale |
+|--------|---------|-------|-----------|
+| Low volatility | σ ≤ 0.001 | Pure CFMM | Arb risk negligible — maximize retail competitiveness |
+| Transition | 0.001 < σ < 0.005 | Linear blend | Progressive arb deterrence as risk increases |
+| High volatility | σ ≥ 0.005 | Pure Power-3 (α=2) | Arb deterrence dominates — accept retail rate penalty |
+
+### Key Mechanisms
+
+1. **Blended Curve** — Convex combination of CFMM (`rx·Δ/(ry+Δ)`) and power-3 (`rx·Δ·(Δ+2ry)/(2·(ry+Δ)²)`). Provably concave and monotonic. The blend weight `w_p3` ∈ [0, 10000] adapts per-trade based on EWMA volatility.
+
+2. **EWMA Volatility Estimation** — Tracks `σ²` from arb log-returns with α=0.10 (half-life ~7 trades). Maps σ linearly to both the fee (30–80 bps) and the blend weight.
+
+3. **Directional Fee Skew** — After each arb, applies ±8 bps skew in the arb's direction. Penalizes follow-on trades in the same direction, discounts opposite. Small enough not to hurt retail; large enough to extract marginal edge.
+
+4. **Flow Share Adaptation** — Mild fee adjustment (+1/+3 bps) based on 10-trade windowed flow share EWMA. Only adjusts fees, never the curve.
+
+5. **BPF Compute Optimization** — Three-way branch in `compute_swap` with early exits for pure CFMM (w_p3=0) and pure power-3 (w_p3≥10000) to avoid double u128 computation within the BPF compute budget.
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────────────┐
+│  compute_swap (Blended Curve, u128 integer)          │
+│                                                      │
+│  1. Read adaptive fee + skew from storage            │
+│  2. Read blend weight w_p3 from storage              │
+│  3. Apply fee+skew: net = input × (10000-eff)/10k   │
+│  4. Curve output (with early-exit optimization):     │
+│     IF w_p3 == 0:     pure CFMM                     │
+│     ELIF w_p3 >= 10000: pure power-3                 │
+│     ELSE: blended (convex combination)               │
+│  5. Return min(output, reserve) as u64               │
+└──────────────────────────────────────────────────────┘
+           ↕ (storage persists between calls)
+┌──────────────────────────────────────────────────────┐
+│  after_swap (fee + curve adaptation engine)          │
+│                                                      │
+│  1. Classify trade: arb (new step) vs retail         │
+│  2. Track retail count per window                    │
+│  3. EWMA vol estimation from arb log-returns         │
+│  4. Per-trade σ→fee mapping + flow-share adjustment  │
+│  5. Per-trade σ→blend weight (w_p3) update           │
+│  6. Per-arb: directional skew (±8 bps)              │
+│  7. Write updated state to storage                   │
+└──────────────────────────────────────────────────────┘
+```
+
+## Score Progression
+
+| Phase | Change | Local Edge | Server Edge |
+|-------|--------|:----------:|:-----------:|
+| 3 | Hybrid AC+D (initial) | 176 | — |
+| 5 | Fixed 40 bps (σ bug fix) | 305 | — |
+| 6 | Flow-share windowed adaptation | 364 | — |
+| 8 | u128 + adaptive [30-80] bps | ~392 | 398.88 |
+| 12 | EWMA α=0.10 + mild flow-share | — | **406.32** |
+| 15 | **Power-3 curve (α=2)** | 85.46 | **453.76** |
+| 16 | **Directional skew (SKEW=8)** | 87.39 | **458.01** |
+| 17 | Per-trade σ-fee update | 87.85 | *pending* |
+| **18** | **σ-adaptive blended curve** | **88.83** | ***pending*** |
+| 19 | Exhaustive parameter sweep | 88.83 | — |
 
 ## Quick Start
 
-1. Copy `programs/starter/src/lib.rs` as your starting point
-2. Implement your pricing logic in `compute_swap`
-3. Submit your `lib.rs` source code to the web UI — the server compiles and runs it
-
-For local development, use the CLI:
-
 ```bash
-# Install the CLI once (from this repo)
-cargo install --path crates/cli
+# Validate locally (12 sims)
+cargo run -- validate programs/starter/src/lib.rs
 
-# Copy the starter template
-cp programs/starter/src/lib.rs my_amm.rs
-
-# Edit your pricing logic
-edit my_amm.rs
-
-# Validate interface + shape + parity checks before benchmarking/submitting
-prop-amm validate my_amm.rs
-
-# Run 1000 simulations locally (~5s on Apple M3 Pro)
-prop-amm run my_amm.rs
-
-# Or run without installing the binary globally
-cargo run -p prop-amm -- run my_amm.rs
+# Submit to server
+cargo run -- submit programs/starter/src/lib.rs
 ```
 
-The CLI compiles your source file and runs it natively — no toolchain setup required beyond Rust.
+## Files
 
-## How the Simulation Works
+| Path | Description |
+|------|-------------|
+| `programs/starter/src/lib.rs` | The AMM pricing strategy (479 lines) |
+| `resources/BUILDERS_LOG.md` | Comprehensive builder's log documenting 19 phases of development |
+| `crates/` | Simulation framework (normalizer, router, arbitrageur, BPF runner) |
 
-Each simulation runs **10,000 steps**. At each step:
+## Builder's Log
 
-1. **Fair price moves** via geometric Brownian motion
-2. **Arbitrageurs trade** — they push each AMM's spot price toward the fair price, extracting profit from stale quotes
-3. **Retail orders arrive** — random buy/sell orders, routed optimally across both AMMs
+The [Builder's Log](resources/BUILDERS_LOG.md) documents the full development journey across 19 phases, including:
 
-Your program competes against a **normalizer AMM** — a constant-product market maker whose fee and liquidity are sampled per simulation. Both pools start from the same base reserves (100 X, 10,000 Y at price 100), then the normalizer applies its sampled liquidity multiplier.
+- Deep codebase analysis of the simulation framework
+- Strategy design (4 candidates evaluated → hybrid selected)
+- The power-3 curve breakthrough (+47.4 edge)
+- The blended curve innovation (+0.98 edge, required BPF compute fix)
+- An exhaustive parameter sweep (14+ experiments, all converged)
+- Proof that temporal fee discrimination is architecturally impossible
+- Analysis of normalizer/router/arbitrageur mechanics
 
-### Why the Normalizer Matters
+## Key Learnings
 
-Without competition, setting 10% fees would appear profitable — huge spreads on the few trades that execute. The normalizer prevents this: if your pricing is too aggressive, retail routes away from your pool and you get little flow.
+1. **Curve shape >> fee tuning.** Power-3 contributed +47.4 edge. All fee tuning combined contributed ~+12.
+2. **Convex blending is free.** A blend of concave functions is provably concave — zero risk, smooth adaptation.
+3. **BPF compute budget is real.** Double u128 computation crashes on server. Early exits are essential.
+4. **Temporal fee discrimination is impossible.** `compute_swap` has no step/time context — the most powerful lever can't be pulled.
+5. **Linear mappings win.** Both σ→fee and σ→blend weight are optimally linear. Non-linear mappings (sqrt, quadratic) consistently perform worse.
 
-There's no free lunch from slightly undercutting either. The optimal strategy depends on market conditions, trade patterns, and how you manage the tradeoff between spread revenue and adverse selection.
+---
 
-### Market Parameters
-
-**Price process**: `S(t+1) = S(t) * exp(-sigma^2/2 + sigma*Z)` where `Z ~ N(0,1)`
-- No drift (mu = 0)
-- Per-step volatility varies across simulations: `sigma ~ U[0.01%, 0.70%]`
-
-**Retail flow**: Poisson arrival, log-normal sizes, 50/50 buy/sell
-- Arrival rate `lambda ~ U[0.4, 1.2]` per step
-- Mean order size `~ U[12, 28]` in Y terms
-
-**Normalizer parameters**:
-- Fee varies per simulation: `norm_fee_bps ~ U{30, 80}` (integer bps)
-- Liquidity varies per simulation: `norm_liquidity_mult ~ U[0.4, 2.0]`
-
-**Arbitrage**: Golden-section search for the optimal trade size that maximizes arbitrage profit (then execute only if it clears a minimum profit floor). The search is early-stopped once the trade size is within ~1% (relative bracket width). Trades are skipped unless expected arb profit is at least `0.01` Y (1 cent).
-
-**Order routing**: Golden-section search over split ratio alpha in [0, 1]. The router picks the split that maximizes total output, and early-stops once the submission trade amount is within ~1% (relative bracket width, with an additional 1% objective-gap stop). Small pricing differences can shift large fractions of volume.
-
-### Edge
-
-Edge measures profitability using the fair price at trade time:
-
-```
-For each trade on your AMM:
-  Sell X (AMM receives X, pays Y):  edge = amount_x * fair_price - amount_y
-  Buy X  (AMM receives Y, pays X):  edge = amount_y - amount_x * fair_price
-```
-
-Retail trades produce positive edge (you profit from the spread). Arbitrage trades produce negative edge (you lose to informed flow). Good strategies maximize the former while minimizing the latter.
-
-## Program Interface
-
-### compute_swap
-
-Your program receives instruction data with reserves and a 1024-byte read-only storage buffer:
-
-| Offset | Size | Field        | Type   | Description                    |
-|--------|------|--------------|--------|--------------------------------|
-| 0      | 1    | side         | u8     | 0=buy X (Y input), 1=sell X   |
-| 1      | 8    | input_amount | u64    | Input token amount (1e9 scale) |
-| 9      | 8    | reserve_x    | u64    | Current X reserve (1e9 scale)  |
-| 17     | 8    | reserve_y    | u64    | Current Y reserve (1e9 scale)  |
-| 25     | 1024 | storage      | [u8]   | Read-only strategy storage     |
-
-Return the `output_amount: u64` (1e9 scale) with `prop_amm_submission_sdk::set_return_data_u64`.
-
-Guideline: decode instruction payloads with `wincode` rather than manual byte offsets. See [wincode docs](https://docs.rs/wincode/latest/wincode/).
-
-### afterSwap (Optional)
-
-After each **real trade** (not during quoting), the engine calls your program with tag byte `2`. This lets you update your 1024-byte storage and observe the current simulation step — useful for strategies that adapt over time (dynamic fees, volatility tracking, etc.).
-
-| Offset | Size | Field         | Type   | Description                    |
-|--------|------|---------------|--------|--------------------------------|
-| 0      | 1    | tag           | u8     | Always 2                       |
-| 1      | 1    | side          | u8     | 0=buy X, 1=sell X              |
-| 2      | 8    | input_amount  | u64    | Input token amount (1e9 scale) |
-| 10     | 8    | output_amount | u64    | Output token amount (1e9 scale)|
-| 18     | 8    | reserve_x     | u64    | Post-trade X reserve           |
-| 26     | 8    | reserve_y     | u64    | Post-trade Y reserve           |
-| 34     | 8    | step          | u64    | Current simulation step        |
-| 42     | 1024 | storage       | [u8]   | Current storage (read/write)   |
-
-To persist updated storage, call `prop_amm_submission_sdk::set_storage` with your modified buffer. If you don't call it, storage remains unchanged. The starter program's afterSwap is a no-op, so storage is entirely optional.
-
-**When afterSwap is called:**
-- After arbitrageur executes a trade
-- After router executes routed trades
-
-**When it is NOT called:**
-- During router quoting (golden-section search for optimal split)
-- During arbitrageur quoting (golden-section search for optimal size)
-
-### Metadata Queries
-
-The runner may request strategy metadata via instruction tag:
-- `3`: return `NAME` bytes
-- `4`: return `get_model_used()` bytes
-
-Use `"None"` for `MODEL_USED` when the submission is fully human-written.
-
-### Requirements
-
-| Requirement   | Description                                                        |
-|---------------|--------------------------------------------------------------------|
-| **NAME**      | Must define `const NAME: &str = "...";` — shown on the leaderboard. |
-| **MODEL_USED**| Must define model metadata and expose `get_model_used() -> &'static str`. Use `"None"` if fully human-written. |
-| **Safe Rust** | `unsafe` code is rejected. Keep your submission fully safe Rust.   |
-| **Monotonic** | Larger input must produce larger output.                           |
-| **Concave**   | Output must be concave in input (diminishing returns per unit).    |
-| **< 100k CU** | Must execute within the compute unit limit.                       |
-
-## Writing a Program
-
-Start with `programs/starter/` — a constant-product AMM with 500 bps fees. The key pieces:
-
-```rust
-use pinocchio::{account_info::AccountInfo, entrypoint, pubkey::Pubkey, ProgramResult};
-use prop_amm_submission_sdk::{set_return_data_bytes, set_return_data_u64};
-
-/// Required: displayed on the leaderboard.
-const NAME: &str = "My Strategy";
-const MODEL_USED: &str = "GPT-5.3-Codex"; // Use "None" for human-written submissions.
-
-const FEE_NUMERATOR: u128 = 950;
-const FEE_DENOMINATOR: u128 = 1000;
-const STORAGE_SIZE: usize = 1024;
-
-#[derive(wincode::SchemaRead)]
-struct ComputeSwapInstruction {
-    side: u8,
-    input_amount: u64,
-    reserve_x: u64,
-    reserve_y: u64,
-    _storage: [u8; STORAGE_SIZE],
-}
-
-#[cfg(not(feature = "no-entrypoint"))]
-entrypoint!(process_instruction);
-
-pub fn process_instruction(
-    _program_id: &Pubkey, _accounts: &[AccountInfo], instruction_data: &[u8],
-) -> ProgramResult {
-    if instruction_data.is_empty() {
-        return Ok(());
-    }
-
-    match instruction_data[0] {
-        0 | 1 => {  // compute_swap
-            let output = compute_swap(instruction_data);
-            set_return_data_u64(output);
-        }
-        2 => {      // afterSwap — update storage here if needed
-        }
-        3 => set_return_data_bytes(NAME.as_bytes()),
-        4 => set_return_data_bytes(get_model_used().as_bytes()),
-        _ => {}
-    }
-    Ok(())
-}
-
-pub fn get_model_used() -> &'static str {
-    MODEL_USED
-}
-
-pub fn compute_swap(data: &[u8]) -> u64 {
-    let decoded: ComputeSwapInstruction = match wincode::deserialize(data) {
-        Ok(decoded) => decoded,
-        Err(_) => return 0,
-    };
-
-    let side = decoded.side;
-    let input_amount = decoded.input_amount as u128;
-    let reserve_x = decoded.reserve_x as u128;
-    let reserve_y = decoded.reserve_y as u128;
-
-    if reserve_x == 0 || reserve_y == 0 {
-        return 0;
-    }
-
-    let k = reserve_x * reserve_y;
-
-    match side {
-        0 => {
-            // Buy X: input is Y, output is X
-            let net_y = input_amount * FEE_NUMERATOR / FEE_DENOMINATOR;
-            let new_ry = reserve_y + net_y;
-            let k_div = (k + new_ry - 1) / new_ry;
-            reserve_x.saturating_sub(k_div) as u64
-        }
-        1 => {
-            // Sell X: input is X, output is Y
-            let net_x = input_amount * FEE_NUMERATOR / FEE_DENOMINATOR;
-            let new_rx = reserve_x + net_x;
-            let k_div = (k + new_rx - 1) / new_rx;
-            reserve_y.saturating_sub(k_div) as u64
-        }
-        _ => 0,
-    }
-}
-
-/// Optional native hook for local testing.
-pub fn after_swap(_data: &[u8], _storage: &mut [u8]) {
-    // Update storage here if needed
-}
-```
-
-For local native runs, the CLI auto-generates adapter exports. You only need strategy logic (`compute_swap` and optionally `after_swap`) in your submission file.
-
-### Tips
-
-- Use `u128` intermediates to avoid overflow (reserves at 1e9 scale can multiply to ~1e24)
-- Prefer typed decode with `wincode::deserialize` for swap/afterSwap payloads
-- Test concavity with `prop-amm validate` before running simulations
-- Think about how your marginal price schedule affects the routing split
-- The arbitrageur is efficient — don't try to extract value from informed flow
-- Storage is zero-initialized at the start of each simulation and persists across all trades within a simulation
-
-## Local Development (CLI)
-
-The CLI compiles and runs your `.rs` source file directly — no manual build step needed.
-
-```bash
-# Run simulations (default: 1000 sims, 10k steps each)
-prop-amm run my_amm.rs
-
-# Run the same workload on a custom seed range
-prop-amm run my_amm.rs --seed-start 100000 --seed-stride 1
-
-# Fewer sims for quick iteration
-prop-amm run my_amm.rs --simulations 10
-
-# Build only (native + BPF artifacts)
-prop-amm build my_amm.rs
-
-# Validate monotonicity, concavity, and native/BPF parity
-prop-amm validate my_amm.rs
-```
-
-Always run `prop-amm validate` before large benchmarks and before submission.
-
-Normalizer performance varies materially across sampled fee/liquidity regimes, so benchmark edge distribution is wider than in a fixed-fee setting.
-
-### Native vs BPF
-
-By default, `prop-amm run` compiles your program as a **native shared library** and runs it directly. This is fast enough for rapid iteration — 1,000 simulations complete in seconds.
-
-BPF mode (`--bpf`) runs your program through the Solana BPF interpreter, which is **~100x slower**. Use it only as a final check before submitting to verify your program compiles and behaves correctly under the BPF runtime. Don't use it for day-to-day development. Run just a few simulations (`--simulations 5`) to sanity-check — running 1,000 sims in BPF mode will take ~15 minutes and isn't worth it for validation.
-
-```bash
-# Fast iteration (native, default)
-prop-amm run my_amm.rs
-
-# Final validation before submission (BPF, slow)
-prop-amm run my_amm.rs --bpf --simulations 10
-```
-
-The engine parallelizes across simulations using up to 8 worker threads (configurable with `--workers`).
-
-### Reproducibility and Seeds
-
-- Local CLI runs are deterministic for a given config.
-- By default, `prop-amm run` uses simulation seeds `0..n_sims-1`.
-- Use `--seed-start` and `--seed-stride` to run out-of-sample seed blocks locally.
-- The server uses a different evaluation seed schedule, so local and server scores can differ slightly even for the same strategy.
-
-| Workload                  | Time           | Platform         |
-|---------------------------|----------------|------------------|
-| 1,000 sims / 10k steps   | ~5s            | Apple M3 Pro, native |
-| 1,000 sims / 10k steps   | ~15 min        | Apple M3 Pro, BPF |
-
-## Submission
-
-Submit your `lib.rs` source code through the web UI. The server handles compilation, validation, and simulation — you don't need any toolchain beyond what's needed for local testing.
-
-The server validates your program (monotonicity and concavity), then runs 1,000 simulations against the normalizer. Local results may diverge slightly from submission scores due to different RNG seeds and hyperparameter variance.
-
-High-level evaluation invariants:
-- The server evaluates each submission on 1,000 simulations.
-- Evaluation uses a fixed checker configuration per server release.
-- Exact holdout seeds are not published.
-
-### Restrictions
-
-Your submitted source code must be a single `lib.rs` file. Allowed dependencies are `pinocchio` (for Solana BPF syscalls) and `wincode` (for instruction decoding). The following are blocked for security:
-
-- `include!()`, `include_str!()`, `include_bytes!()` (compile-time file access)
-- `env!()`, `option_env!()` (compile-time environment access)
-- `extern crate` declarations
-- External module files (`mod foo;`)
+*Built for the [Prop AMM Challenge](https://ammchallenge.com/prop-amm)*
